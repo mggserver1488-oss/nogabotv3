@@ -1115,12 +1115,12 @@ ITEMS = {
     "mk_mgg":       (PREMIUM_MK_MGG, "Амулет MGG", 145, 0.57),
     "mk_sandsmoon": (PREMIUM_MK_SANDSMOON, "Амулет SandsMoon", 40, 3.45),
     "mk_fixsahal1": (PREMIUM_MK_FIXSAHAL1, "Амулет Fixsahal1", 45, 5.75),
-    "mk_mk":        (PREMIUM_MK_MK, "Амулет Mk", 90, 1.72),
+    "mk_mk":        (PREMIUM_MK_MK, "Амулет Rpuk_01", 90, 1.72),
     "mk_panther":   (PREMIUM_MK_PANTHER, "Амулет Haos", 60, 8.04),
     "mk_vector":    (PREMIUM_MK_VECTOR, "Амулет Vector", 40, 4.02),
     "mk_broken":    (PREMIUM_MK_BROKEN, "Сломанный амулет", 2, 60),
     "mk_mary":      (PREMIUM_MK_MARY, "Амулет Mary", 50, 5.75),
-    "mk_veron03":   (PREMIUM_MK_VERON03, "Амулет Veron03", 35, 10),
+    "mk_veron03":   (PREMIUM_MK_VERON03, "Амулет @tuxpq", 35, 10),
     "vip_charm":    (PREMIUM_VIP_ITEM, "VIP-амулет", 270, 0),
     "strange_coin": (PREMIUM_STRANGE_COIN, "Странная монета", 0, 0.7),
 
@@ -2454,9 +2454,11 @@ for _top in _TOP_WORDS:
     for _gcoin in _GOLD_COIN_WORDS:
         ALIAS_PHRASES[f"{_top} {_gcoin}"] = "топ гкоин"
         ALIAS_PHRASES[f"гл {_top} {_gcoin}"] = "гл топ гкоин"
+        ALIAS_PHRASES[f"{_top} {_gcoin} вся"] = "топ гкоин вся"
     for _dcoin in _DIAMOND_COIN_WORDS:
         ALIAS_PHRASES[f"{_top} {_dcoin}"] = "топ акоин"
         ALIAS_PHRASES[f"гл {_top} {_dcoin}"] = "гл топ акоин"
+        ALIAS_PHRASES[f"{_top} {_dcoin} вся"] = "топ акоин вся"
     for _evo in _EVO_WORDS:
         ALIAS_PHRASES[f"{_top} {_evo}"] = "топ эво"
         ALIAS_PHRASES[f"гл {_top} {_evo}"] = "гл топ эво"
@@ -4679,7 +4681,8 @@ async def apply_chronos_orb_procs(user_id: int, active_items) -> tuple:
             lines.append(f"+{amount} 🔮")
 
     if random.random() < CHRONOS_ORB_POTION_CHANCE:
-        potion_key = random.choice(POTION_ORDER)
+        potion_pool = [k for k in POTION_ORDER if k not in ("potion_evo_reset", "potion_rebirth_reset", "potion_debuff")]
+        potion_key = random.choice(potion_pool)
         stock_row = await db_query_one("SELECT potion_stock FROM users WHERE user_id = ?", (user_id,))
         stock = parse_potion_stock(stock_row[0] if stock_row else "")
         stock[potion_key] = stock.get(potion_key, 0) + 1
@@ -5070,6 +5073,13 @@ class SpamProtectionMiddleware(BaseMiddleware):
         already_seen = await _has_been_seen_in_chat(user.id, chat.id)
         if already_seen:
             return await handler(event, data)
+        try:
+            member = await bot.get_chat_member(chat.id, user.id)
+            if member.status in ("creator", "administrator"):
+                await track_membership(user.id, chat.id)
+                return await handler(event, data)
+        except Exception:
+            pass
 
         await _apply_game_ban(user.id, user.username)
         await track_membership(user.id, chat.id)
@@ -6543,12 +6553,20 @@ async def top_gold_coin_local(message: Message):
 async def top_gold_coin_global(message: Message):
     await send_gold_coin_top(message, None, "ТОП ГКОИН ВЕЗДЕ")
 
+@dp.message(F.text.lower() == "топ гкоин вся")
+async def top_gold_coin_global_suffix(message: Message):
+    await send_gold_coin_top(message, None, "ТОП ГКОИН ВЕЗДЕ")
+
 @dp.message(F.text.lower() == "топ акоин")
 async def top_diamond_coin_local(message: Message):
     await send_diamond_coin_top(message, message.chat.id, "ТОП АКОИН ЭТОГО ЧАТА")
 
 @dp.message(F.text.lower() == "гл топ акоин")
 async def top_diamond_coin_global(message: Message):
+    await send_diamond_coin_top(message, None, "ТОП АКОИН ВЕЗДЕ")
+
+@dp.message(F.text.lower() == "топ акоин вся")
+async def top_diamond_coin_global_suffix(message: Message):
     await send_diamond_coin_top(message, None, "ТОП АКОИН ВЕЗДЕ")
 
 @dp.message(F.text.lower() == "топ ног")
