@@ -1,6 +1,8 @@
 import asyncio
 import bisect
 import functools
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -8,7 +10,7 @@ import re
 import time
 from collections import deque
 from datetime import datetime
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, parse_qsl
 
 import libsql
 import aiohttp
@@ -12021,8 +12023,136 @@ async def admin_event_status(message: Message):
 
     await message.reply(TEXTS["admin_event_status_1"].format(v0=mult, v1=left_text))
 
+def _verify_telegram_init_data(init_data: str, max_age: int = 3600):
+    """Проверяет подпись initData, которую Telegram WebApp кладёт в window.Telegram.WebApp.initData.
+    Возвращает dict пользователя (как в initDataUnsafe.user) если подпись верна и данные не
+    протухли, иначе None. Без этой проверки любой человек мог бы запросить чужой профиль,
+    просто подставив нужный user_id в URL."""
+    if not init_data or not TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        return None
+
+    auth_date = int(pairs.get("auth_date", 0))
+    if max_age and (int(time.time()) - auth_date) > max_age:
+        return None
+
+    user_raw = pairs.get("user")
+    if not user_raw:
+        return None
+    try:
+        return json.loads(user_raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+async def api_profile(request):
+    """Отдаёт мини-аппу реальные данные профиля игрока — те же цифры, что показывает команда
+    "моя нога", посчитанные теми же функциями (get_level_index/get_multiplier/get_active_titles
+    и т.д.), чтобы бот и мини-апп никогда не расходились."""
+    headers = {"Access-Control-Allow-Origin": "*"}
+    init_data = request.query.get("init_data", "")
+    tg_user = _verify_telegram_init_data(init_data)
+    if not tg_user or "id" not in tg_user:
+        return web.json_response({"error": "unauthorized"}, status=401, headers=headers)
+
+    user_id = int(tg_user["id"])
+    username = tg_user.get("username") or tg_user.get("first_name") or "Без имени"
+
+    row = await ensure_user(user_id, username)
+    score, evolution_level, coins = row[2], row[3], row[5]
+    cases_opened = row[7]
+    vip_until = row[12]
+    rebirth_points, rebirth_count = row[14], row[15]
+    upgrades = parse_upgrades(row[16])
+    active_items = parse_equipped(row[18])
+    nickname = row[19] if len(row) > 19 else None
+    ultra_rebirth = bool(row[21])
+    prestige_points = row[27] if len(row) > 27 else 0
+    craft_points = row[32] if len(row) > 32 else 0
+    crafts_done = row[36] if len(row) > 36 else 0
+    chronos_boost_pct = row[34] if len(row) > 34 else 100
+    gc_row = await db_query_one("SELECT gold_coin, diamond_coin FROM users WHERE user_id = ?", (user_id,))
+    gold_coin, diamond_coin = gc_row if gc_row else (0, 0)
+    vip_active = is_vip_active(vip_until)
+    shown_name = display_name(username, nickname)
+
+    level = get_level_index(score, evolution_level, rebirth_count, ultra_rebirth, **hardness_kwargs(row))
+    emoji, level_name, show_level = get_level_visual(level)
+    nxt = next_level_text(score, evolution_level, rebirth_count, ultra_rebirth, **hardness_kwargs(row))
+    inv_rows_profile = await get_inventory(user_id)
+    nano_it_count = {k: q for k, q in inv_rows_profile}.get("nano_it", 0)
+    mult = get_multiplier(evolution_level, active_items, vip_active, upgrades, ultra_rebirth, chronos_boost_pct, nano_it_count)
+
+    titles = get_active_titles(row)
+    if is_developer_id(user_id):
+        titles.add("developer")
+    display_title = get_display_title(titles)
+    title_label = TITLE_LABELS.get(display_title, "Игрок")
+
+    now = int(time.time())
+    hardness_pct = hardness_percent(evolution_level, rebirth_count, active_items, **hardness_kwargs(row))
+
+    data = {
+        "name": shown_name,
+        "title": title_label,
+        "level": level if (show_level or ultra_rebirth) else None,
+        "level_name": level_name,
+        "score": score,
+        "coins": coins,
+        "gold_coin": gold_coin,
+        "diamond_coin": diamond_coin,
+        "prestige_points": prestige_points,
+        "evolution_level": evolution_level,
+        "rebirth_count": rebirth_count,
+        "rebirth_points": rebirth_points,
+        "craft_points": craft_points,
+        "crafts_done": crafts_done,
+        "cases_opened": cases_opened,
+        "boost_pct": round((mult - 1) * 100),
+        "hardness_pct": hardness_pct,
+        "vip_active": vip_active,
+        "vip_until": vip_until if vip_active else 0,
+        "ultra_rebirth": ultra_rebirth,
+        "next_level_text": nxt,
+        "server_time": now,
+    }
+    return web.json_response(data, headers=headers)
+
+async def api_profile_options(request):
+    """Отвечает на CORS preflight-запрос (OPTIONS), который браузер шлёт перед fetch с другого
+    origin, чем сам aiohttp-сервер (мини-апп хостится отдельно от бота)."""
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
+
 async def handle(request):
     return web.Response(text="Бот Нога Работает!")
+
+# Путь к miniapp.html — должен лежать в той же папке репозитория, что и этот bot.py
+# (Render деплоит весь репозиторий целиком, так что просто закинь файл рядом).
+MINIAPP_PATH = os.path.join(os.path.dirname(__file__), "miniapp.html")
+
+async def handle_miniapp(request):
+    if not os.path.isfile(MINIAPP_PATH):
+        return web.Response(text="miniapp.html не найден рядом с bot.py на сервере", status=404)
+    with open(MINIAPP_PATH, "r", encoding="utf-8") as f:
+        html = f.read()
+    return web.Response(text=html, content_type="text/html")
 
 async def keep_alive():
     url = os.environ.get("RENDER_EXTERNAL_URL")
@@ -12050,6 +12180,9 @@ async def main():
 
     app = web.Application()
     app.router.add_get('/', handle)
+    app.router.add_get('/miniapp', handle_miniapp)
+    app.router.add_get('/api/profile', api_profile)
+    app.router.add_options('/api/profile', api_profile_options)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
