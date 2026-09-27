@@ -1514,7 +1514,12 @@ document.getElementById('open-help').addEventListener('click', () => {
 
 ovBack.addEventListener('click', () => {
   if (state.path.length > 0) {
-    state.path.pop();
+    const pageData = state.page === 1 ? DATA.page1 : DATA.page2;
+    if (state.path.length === 2 && Object.keys(pageData[state.path[0]]).length === 1) {
+      state.path = [];
+    } else {
+      state.path.pop();
+    }
     render();
   } else {
     overlay.classList.remove('open');
@@ -1559,7 +1564,9 @@ function renderCategoryList(pageData){
 
   ovBody.querySelectorAll('.cat-item').forEach(el => {
     el.addEventListener('click', () => {
-      state.path = [el.dataset.cat];
+      const cat = el.dataset.cat;
+      const tabNames = Object.keys(pageData[cat]);
+      state.path = tabNames.length === 1 ? [cat, tabNames[0]] : [cat];
       render();
     });
   });
@@ -1593,7 +1600,7 @@ function renderArticle(item){
     <h2>${esc(item.h)}</h2>`;
   if (item.lead) html += `<p class="lead">${esc(item.lead)}</p>`;
 
-  (item.blocks || []).forEach(b => {
+  (item.blocks || []).forEach((b, blockIdx) => {
     if (b.t === 'note') {
       html += `<div class="note">${b.n}</div>`;
       return;
@@ -1605,14 +1612,15 @@ function renderArticle(item){
     if (b.t === 'accordion') {
       html += `<div class="section-h">${esc(b.label || '')}</div><div class="acc-list">`;
       b.rows.forEach(([name, pct, detail, mech], idx) => {
+        const uid = `${blockIdx}-${idx}`;
         const mark = mech ? '<span class="acc-mark">✨</span>' : '';
         const body = mech ? `${detail}<div class="acc-mech">${esc(mech)}</div>` : detail;
         html += `<div class="acc-item">
-          <div class="acc-head" data-acc="${idx}">
+          <div class="acc-head" data-acc="${uid}">
             <span class="acc-name">${esc(name)}${mark}</span>
             <span class="acc-pct">${esc(pct)}</span>
           </div>
-          <div class="acc-body" id="acc-body-${idx}">${body}</div>
+          <div class="acc-body" id="acc-body-${uid}">${body}</div>
         </div>`;
       });
       html += '</div>';
