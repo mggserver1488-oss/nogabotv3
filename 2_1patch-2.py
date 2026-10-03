@@ -682,6 +682,12 @@ TEXTS = {
     "cmd_ban_player_7": '{v0} уже забанен.',
     "cmd_unban_player_1": '✅ {v0} разбанен.',
     "cmd_unban_player_2": '{v0} не был забанен в игре.',
+    "cmd_ban_list_1": '✅ Список банов пуст — в игре никто не забанен.',
+    "cmd_ban_list_2": '🚫 <b>Забанено игроков: {v0}</b>\n{v1}',
+    "cmd_ban_list_3": 'Список банов доступен только VIP, модераторам, админам и владельцу.',
+    "cmd_unban_all_1": 'Массовый разбан доступен только админам и владельцу бота.',
+    "cmd_unban_all_2": '✅ Банов нет — разбанивать некого.',
+    "cmd_unban_all_3": '✅ Разбанено игроков: {v0}. Статы возвращены из снапшотов.',
     "send_legs_top_1": 'В топе пока пусто, никто еще не кинул ногу... 🧍',
     "send_evo_top_1": 'В топе пока пусто.',
     "send_coin_top_1": 'В топе пока пусто.',
@@ -4079,6 +4085,7 @@ async def init_db():
             await db_exec(stmt)
         except Exception:
             pass
+    await _install_currency_guard()
 
 async def get_user(user_id: int):
     if user_id in _user_cache:
@@ -5213,10 +5220,67 @@ class StaleCallbackGuardMiddleware(BaseMiddleware):
                 pass
             return
 
+# ==== Игнор «истории» после простоя бота ====
+# Пока бот лежал, Telegram копит апдейты (до 24 ч) и при старте вываливает их разом.
+# Из-за этого: (а) бот отвечал на сотни старых сообщений спамом, (б) FloodBanMiddleware
+# видел 200+ сообщений от одного юзера за миг и БАНИЛ невиновных. Лечим двумя слоями:
+#   1) _drain_pending_updates() — на старте вычитывает и выбрасывает всю очередь;
+#      платежи (successful_payment) сохраняются и обрабатываются, чтобы не потерять
+#      оплаченный VIP;
+#   2) StaleMessageMiddleware — самая первая в цепочке; молча роняет сообщения старше
+#      STALE_MESSAGE_MAX_AGE секунд (страховка на случай лагов сети/рестартов).
+STALE_MESSAGE_MAX_AGE = 60  # сек
+
+class StaleMessageMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.date is not None:
+            if getattr(event, "successful_payment", None) is None:
+                try:
+                    age = time.time() - event.date.timestamp()
+                except Exception:
+                    age = 0
+                if age > STALE_MESSAGE_MAX_AGE:
+                    return
+        return await handler(event, data)
+
+async def _drain_pending_updates() -> list:
+    """Вычитывает и подтверждает (= выбрасывает) всю накопленную очередь апдейтов.
+    Возвращает только апдейты с оплатой — их надо всё равно обработать."""
+    kept = []
+    dropped = 0
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        offset = None
+        while True:
+            updates = await bot.get_updates(offset=offset, limit=100, timeout=0)
+            if not updates:
+                break
+            for u in updates:
+                offset = u.update_id + 1
+                msg = u.message
+                if msg is not None and getattr(msg, "successful_payment", None) is not None:
+                    kept.append(u)
+                else:
+                    dropped += 1
+        print(f"Очередь апдейтов очищена: выброшено {dropped}, платежей сохранено {len(kept)}")
+    except Exception as e:
+        print(f"_drain_pending_updates не удалось (работает StaleMessageMiddleware): {e}")
+    return kept
+
+async def _feed_kept_updates(updates: list):
+    """Обрабатывает сохранённые платежи уже после старта поллинга."""
+    await asyncio.sleep(3)
+    for u in updates:
+        try:
+            await dp.feed_update(bot, u)
+        except Exception as e:
+            print(f"Не удалось обработать сохранённый платёж {u.update_id}: {e}")
+
 dp.callback_query.outer_middleware(ChatBanMiddleware())
 dp.callback_query.outer_middleware(GameBanMiddleware())
 dp.callback_query.middleware(StaleCallbackGuardMiddleware())
 
+dp.message.outer_middleware(StaleMessageMiddleware())  # ПЕРВОЙ — до FloodBan
 dp.message.outer_middleware(FloodBanMiddleware())
 dp.message.outer_middleware(ChatBanMiddleware())
 dp.message.outer_middleware(GameBanMiddleware())
@@ -6297,44 +6361,133 @@ async def _resolve_ban_target(message: Message, username_arg: str | None):
         return None, None
     return None, None
 
-BAN_ROFL_VALUE = -9999999999
+BAN_ROFL_VALUE = -99999999
 BAN_SNAPSHOT_COLUMNS = ("score", "coins", "evolution_level", "rebirth_points")
 
+# ==== Валюта НИКОГДА не бывает отрицательной (кроме забаненных — у них рофл-дно) ====
+# Три слоя защиты:
+#   1) SQL-триггер на users (AFTER UPDATE / AFTER INSERT) — срабатывает ВНУТРИ БД на любой
+#      записи из любого места кода (перерождение, коины, ноги, !снять, кейсы, крафт и т.д.),
+#      поэтому ни один хендлер физически не может оставить минус;
+#   2) фоновый цикл currency_guard_loop — страховка, если триггер не создался/не поддержан;
+#   3) clamp при разбане (см. _restore_stats_after_unban / _unban_player_db).
+# Забаненные (game_banned = 1) из зачистки исключены — иначе рофл-статы бана
+# (BAN_ROFL_VALUE) обнулялись бы сразу после выставления.
+CURRENCY_COLUMNS = (
+    "score", "coins", "rebirth_points", "craft_points",
+    "prestige_points", "gold_coin", "diamond_coin",
+)
+_NEG_CONDITION = " OR ".join(f"{c} < 0" for c in CURRENCY_COLUMNS)
+_NEG_CONDITION_NEW = " OR ".join(f"NEW.{c} < 0" for c in CURRENCY_COLUMNS)
+_CLAMP_SET = ", ".join(f"{c} = MAX({c}, 0)" for c in CURRENCY_COLUMNS)
+_NOT_BANNED = "(game_banned IS NULL OR game_banned = 0)"
+CURRENCY_GUARD_INTERVAL = 60
+
+async def _install_currency_guard():
+    """Пересоздаёт триггеры 'не уходить в минус' (DROP + CREATE при каждом старте — чтобы
+    изменение списка CURRENCY_COLUMNS подхватывалось само)."""
+    for name, event in (
+        ("trg_users_no_neg_currency_upd", "UPDATE"),
+        ("trg_users_no_neg_currency_ins", "INSERT"),
+    ):
+        try:
+            await db_exec(f"DROP TRIGGER IF EXISTS {name}")
+            await db_exec(
+                f"CREATE TRIGGER {name} AFTER {event} ON users FOR EACH ROW "
+                f"WHEN (NEW.game_banned IS NULL OR NEW.game_banned = 0) AND ({_NEG_CONDITION_NEW}) "
+                f"BEGIN UPDATE users SET {_CLAMP_SET} WHERE user_id = NEW.user_id; END"
+            )
+        except Exception as e:
+            print(f"Триггер {name} не создан (работает фоновая страховка): {e}")
+
+async def clamp_negative_currency() -> int:
+    """Находит НЕ забаненных игроков с минусовой валютой и сбрасывает минус в 0.
+    Точечные UPDATE ... WHERE user_id = ? — чтобы инвалидировался кэш только этих игроков."""
+    rows = await db_query(
+        f"SELECT user_id FROM users WHERE {_NOT_BANNED} AND ({_NEG_CONDITION})"
+    )
+    for (uid,) in rows:
+        await db_exec(f"UPDATE users SET {_CLAMP_SET} WHERE user_id = ?", (uid,))
+    return len(rows)
+
+async def enforce_banned_stats() -> int:
+    """Инвариант 'забанен => статы = BAN_ROFL_VALUE': если что-то перезаписало статы
+    забаненного (гонка, старый бан с другим значением) — возвращаем рофл-дно.
+    Снапшот настоящих статов при этом не затирается (см. _wipe_stats_for_ban)."""
+    r = BAN_ROFL_VALUE
+    rows = await db_query(
+        "SELECT user_id FROM users WHERE game_banned = 1 AND "
+        "(score != ? OR coins != ? OR evolution_level != ? OR rebirth_points != ?)",
+        (r, r, r, r),
+    )
+    for (uid,) in rows:
+        await _wipe_stats_for_ban(uid)
+    return len(rows)
+
+async def currency_guard_loop():
+    """Фоновая страховка: сразу на старте и дальше раз в CURRENCY_GUARD_INTERVAL сек."""
+    while True:
+        try:
+            await clamp_negative_currency()
+            await enforce_banned_stats()
+        except Exception as e:
+            print(f"currency_guard_loop ошибка: {e}")
+        await asyncio.sleep(CURRENCY_GUARD_INTERVAL)
+
 async def _wipe_stats_for_ban(target_id: int):
-    """Рофл-часть бана: перед обнулением сохраняет текущие score/coins/evolution_level/
-    rebirth_points в game_banned_snapshot (JSON), затем выставляет их всем в
-    BAN_ROFL_VALUE — чтобы у забаненного в топах/инфо было эффектное дно. При разбане
-    _restore_stats_after_unban читает этот снапшот и возвращает всё как было —
-    поэтому обязательно снапшотим ДО перезаписи, а не полагаемся на _user_cache
-    (он может быть протухшим/пустым)."""
+    """Рофл-часть бана: сохраняет текущие score/coins/evolution_level/rebirth_points в
+    game_banned_snapshot (JSON), затем выставляет их всем в BAN_ROFL_VALUE и game_banned = 1
+    ОДНИМ запросом (атомарно). Если валидный снапшот уже есть (повторный/параллельный бан —
+    спамер шлёт много сообщений, и несколько обработчиков могут дойти сюда одновременно) —
+    он НЕ перезаписывается, иначе настоящие статы терялись бы навсегда: снапшот снялся бы
+    уже с рофл-значений, и разбан 'восстанавливал' бы минус."""
     row = await db_query_one(
-        "SELECT score, coins, evolution_level, rebirth_points FROM users WHERE user_id = ?",
+        "SELECT score, coins, evolution_level, rebirth_points, game_banned_snapshot "
+        "FROM users WHERE user_id = ?",
         (target_id,),
     )
-    snapshot = dict(zip(BAN_SNAPSHOT_COLUMNS, row)) if row else {c: 0 for c in BAN_SNAPSHOT_COLUMNS}
+    snapshot_json = None
+    if row and row[4]:
+        try:
+            if isinstance(json.loads(row[4]), dict):
+                snapshot_json = row[4]
+        except Exception:
+            snapshot_json = None
+    if snapshot_json is None:
+        if row:
+            snapshot = dict(zip(BAN_SNAPSHOT_COLUMNS, row[:4]))
+        else:
+            snapshot = {c: 0 for c in BAN_SNAPSHOT_COLUMNS}
+        snapshot_json = json.dumps(snapshot)
+    r = BAN_ROFL_VALUE
     await db_exec(
-        "UPDATE users SET game_banned_snapshot = ?, score = ?, coins = ?, "
+        "UPDATE users SET game_banned = 1, game_banned_snapshot = ?, score = ?, coins = ?, "
         "evolution_level = ?, rebirth_points = ? WHERE user_id = ?",
-        (json.dumps(snapshot), BAN_ROFL_VALUE, BAN_ROFL_VALUE, BAN_ROFL_VALUE, BAN_ROFL_VALUE, target_id),
+        (snapshot_json, r, r, r, r, target_id),
     )
 
 async def _apply_game_ban(user_id: int, username: str | None = None):
     """Единая точка входа 'забанить игрока в игре' — переиспользуется !бан/swoon/
-    snowgrave, !бан чат, SpamProtectionMiddleware и PluginSpamMiddleware, чтобы
-    последовательность (ensure_user -> game_banned=1 -> снапшот+обнуление статов ->
-    добавить в in-memory сет) не дублировалась и не расходилась между местами.
-    username опционален: если юзера ещё нет в БД, а username неизвестен (например,
-    он сам никогда не писал профиль), ensure_user всё равно создаст строку с
-    user_id — просто без красивого имени."""
+    snowgrave, !бан чат, SpamProtectionMiddleware и PluginSpamMiddleware.
+    user_id добавляется в in-memory сет СРАЗУ (до любых await): GameBanMiddleware тогда
+    уже не пропустит следующие сообщения этого юзера, пока идут запросы в БД.
+    username опционален: если юзера ещё нет в БД, ensure_user создаст строку с user_id."""
+    _game_banned_ids.add(user_id)
     await ensure_user(user_id, username or str(user_id))
     await db_exec("UPDATE users SET game_banned = 1 WHERE user_id = ?", (user_id,))
     await _wipe_stats_for_ban(user_id)
-    _game_banned_ids.add(user_id)
+
+def _clean_stat(value) -> int:
+    """Значение из снапшота -> int >= 0 (отрицательного у нормального игрока быть не может)."""
+    try:
+        return max(0, int(value))
+    except Exception:
+        return 0
 
 async def _restore_stats_after_unban(target_id: int):
-    """Возвращает score/coins/evolution_level/rebirth_points к значениям на момент
-    бана. Если снапшота почему-то нет (например, game_banned=1 выставили руками
-    в БД, минуя !бан) — ничего не трогаем, чтобы не обнулить игрока по ошибке."""
+    """Возвращает score/coins/evolution_level/rebirth_points к значениям на момент бана.
+    Если снапшота нет (game_banned=1 выставили руками в БД, минуя !бан) — ничего не трогаем,
+    чтобы не обнулить игрока по ошибке. Отрицательные значения в снапшоте -> 0."""
     row = await db_query_one("SELECT game_banned_snapshot FROM users WHERE user_id = ?", (target_id,))
     raw = row[0] if row else None
     if not raw:
@@ -6343,18 +6496,98 @@ async def _restore_stats_after_unban(target_id: int):
         snapshot = json.loads(raw)
     except Exception:
         snapshot = None
-    if not snapshot:
+    if not isinstance(snapshot, dict) or not snapshot:
         await db_exec("UPDATE users SET game_banned_snapshot = NULL WHERE user_id = ?", (target_id,))
         return
     await db_exec(
         "UPDATE users SET game_banned_snapshot = NULL, score = ?, coins = ?, "
         "evolution_level = ?, rebirth_points = ? WHERE user_id = ?",
         (
-            snapshot.get("score", 0), snapshot.get("coins", 0),
-            snapshot.get("evolution_level", 0), snapshot.get("rebirth_points", 0),
+            _clean_stat(snapshot.get("score", 0)), _clean_stat(snapshot.get("coins", 0)),
+            _clean_stat(snapshot.get("evolution_level", 0)), _clean_stat(snapshot.get("rebirth_points", 0)),
             target_id,
         ),
     )
+
+async def _unban_player_db(user_id: int):
+    """Полный разбан одного игрока в БД и памяти. Порядок важен: сначала возвращаем статы
+    из снапшота (пока game_banned = 1 и триггер 'не в минус' не вмешивается), и только потом
+    снимаем флаг. evolution_level дополнительно клампится: если снапшота не было и там
+    остался рофл-минус, эво не должно остаться отрицательным."""
+    await _restore_stats_after_unban(user_id)
+    await db_exec(
+        "UPDATE users SET game_banned = 0, evolution_level = MAX(evolution_level, 0) WHERE user_id = ?",
+        (user_id,),
+    )
+    _game_banned_ids.discard(user_id)
+
+# ВАЖНО: эти два хендлера стоят ПЕРЕД cmd_ban_player / cmd_unban_player — иначе их регэкспы
+# (!бан @?\w+ / !разбан @?\w+) приняли бы слова «лист» и «все» за username.
+
+async def _can_view_ban_list(message: Message) -> bool:
+    """Доступ к !бан лист: активный VIP, модератор, админ или овнер."""
+    if await is_moderator_or_above(message):  # овнер + admin + moderator
+        return True
+    row = await get_user(message.from_user.id)
+    return bool(row) and is_vip_active(row[12])
+
+@dp.message(F.text.regexp(r"(?i)^!(?:бан\s*лист|бан\s+список|банлист)$"))
+async def cmd_ban_list(message: Message):
+    """!бан лист — список всех забаненных в игре игроков (VIP, модератор, админ, овнер)."""
+    if not await _can_view_ban_list(message):
+        await message.reply(TEXTS["cmd_ban_list_3"])
+        return
+    rows = await db_query(
+        "SELECT user_id, username, nickname FROM users WHERE game_banned = 1 ORDER BY lower(username)"
+    )
+    if not rows:
+        await message.reply(TEXTS["cmd_ban_list_1"])
+        return
+
+    MAX_SHOWN = 200
+    lines = [
+        f"● {esc(display_name(username or str(user_id), nickname))} — <code>{user_id}</code>"
+        for user_id, username, nickname in rows[:MAX_SHOWN]
+    ]
+    if len(rows) > MAX_SHOWN:
+        lines.append(f"… и ещё {len(rows) - MAX_SHOWN}")
+
+    chunks, cur, size = [], [], 0
+    for ln in lines:
+        if size + len(ln) + 1 > 3500 and cur:
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
+        cur.append(ln)
+        size += len(ln) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+
+    for i, chunk in enumerate(chunks):
+        text = TEXTS["cmd_ban_list_2"].format(v0=len(rows), v1=chunk) if i == 0 else chunk
+        await message.reply(text)
+
+@dp.message(F.text.regexp(r"(?i)^!разбан\s+(?:все|всех|всем|всё|вся|all)$"))
+async def cmd_unban_all(message: Message):
+    """!разбан все — снять игровой бан со ВСЕХ забаненных игроков и вернуть им статы из
+    снапшотов. Админ и овнер. Telegram-баны в самих чатах и чёрный список чатов
+    (!бан чат) не трогаются."""
+    if not await is_admin_role_or_above(message):
+        await message.reply(TEXTS["cmd_unban_all_1"])
+        return
+    await log_admin_action(message)
+    rows = await db_query("SELECT user_id FROM users WHERE game_banned = 1")
+    ids = {r[0] for r in rows} | set(_game_banned_ids)
+    if not ids:
+        await message.reply(TEXTS["cmd_unban_all_2"])
+        return
+    done = 0
+    for uid in ids:
+        try:
+            await _unban_player_db(uid)
+            done += 1
+        except Exception as e:
+            print(f"!разбан все: не удалось разбанить {uid}: {e}")
+    await message.reply(TEXTS["cmd_unban_all_3"].format(v0=done))
 
 @dp.message(F.text.regexp(r"(?i)^!бан(?:\s+@?\w+)?$"))
 async def cmd_ban_player(message: Message):
@@ -6419,9 +6652,7 @@ async def cmd_unban_player(message: Message):
         await message.reply(TEXTS["cmd_unban_player_2"].format(v0=esc(target_username)))
         return
 
-    await db_exec("UPDATE users SET game_banned = 0 WHERE user_id = ?", (target_id,))
-    await _restore_stats_after_unban(target_id)
-    _game_banned_ids.discard(target_id)
+    await _unban_player_db(target_id)
 
     chat_unban_note = ""
     try:
@@ -12193,6 +12424,11 @@ async def main():
     asyncio.create_task(chronos_orb_boost_loop())
     asyncio.create_task(auto_log_cleanup_loop())
     asyncio.create_task(_flush_player_log_buffer())
+    asyncio.create_task(currency_guard_loop())
+
+    kept_updates = await _drain_pending_updates()
+    if kept_updates:
+        asyncio.create_task(_feed_kept_updates(kept_updates))
 
     print("Бот НОГА запущен!")
     try:
