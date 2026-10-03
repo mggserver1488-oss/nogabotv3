@@ -6363,6 +6363,13 @@ async def _resolve_ban_target(message: Message, username_arg: str | None):
 
 BAN_ROFL_VALUE = -99999999
 BAN_SNAPSHOT_COLUMNS = ("score", "coins", "evolution_level", "rebirth_points")
+# Рофл-значения бана (текущее и старое). Настоящим статом игрока они быть не могут —
+# если такое значение оказалось в снапшоте (двойной бан у старой версии снимал снапшот
+# уже с минусов), оно считается мусором и заменяется на 0.
+BAN_ROFL_VALUES = (BAN_ROFL_VALUE, -9999999999)
+
+def _sanitize_snapshot(snapshot: dict) -> dict:
+    return {k: (0 if v in BAN_ROFL_VALUES else v) for k, v in snapshot.items()}
 
 # ==== Валюта НИКОГДА не бывает отрицательной (кроме забаненных — у них рофл-дно) ====
 # Три слоя защиты:
@@ -6424,10 +6431,34 @@ async def enforce_banned_stats() -> int:
         await _wipe_stats_for_ban(uid)
     return len(rows)
 
+async def repair_rofl_leftovers() -> int:
+    """Чинит НЕ забаненных игроков, у которых после старого двойного бана/разбана остался
+    рофл-минус бана в любом из четырёх статов (в первую очередь эволюция — её автозачистка
+    валюты не трогает). Точное совпадение с BAN_ROFL_VALUES: легитимным значением это
+    быть не может. Эво -> 0, валюта -> 0."""
+    ph = ",".join("?" for _ in BAN_ROFL_VALUES)
+    rows = await db_query(
+        f"SELECT user_id FROM users WHERE {_NOT_BANNED} AND "
+        f"(evolution_level IN ({ph}) OR score IN ({ph}) OR coins IN ({ph}) OR rebirth_points IN ({ph}))",
+        BAN_ROFL_VALUES * 4,
+    )
+    for (uid,) in rows:
+        await db_exec(
+            "UPDATE users SET "
+            f"evolution_level = CASE WHEN evolution_level IN ({ph}) THEN 0 ELSE evolution_level END, "
+            f"score = CASE WHEN score IN ({ph}) THEN 0 ELSE score END, "
+            f"coins = CASE WHEN coins IN ({ph}) THEN 0 ELSE coins END, "
+            f"rebirth_points = CASE WHEN rebirth_points IN ({ph}) THEN 0 ELSE rebirth_points END "
+            "WHERE user_id = ?",
+            BAN_ROFL_VALUES * 4 + (uid,),
+        )
+    return len(rows)
+
 async def currency_guard_loop():
     """Фоновая страховка: сразу на старте и дальше раз в CURRENCY_GUARD_INTERVAL сек."""
     while True:
         try:
+            await repair_rofl_leftovers()
             await clamp_negative_currency()
             await enforce_banned_stats()
         except Exception as e:
@@ -6449,13 +6480,15 @@ async def _wipe_stats_for_ban(target_id: int):
     snapshot_json = None
     if row and row[4]:
         try:
-            if isinstance(json.loads(row[4]), dict):
-                snapshot_json = row[4]
+            old_snap = json.loads(row[4])
+            if isinstance(old_snap, dict):
+                snapshot_json = json.dumps(_sanitize_snapshot(old_snap))
         except Exception:
             snapshot_json = None
     if snapshot_json is None:
         if row:
-            snapshot = dict(zip(BAN_SNAPSHOT_COLUMNS, row[:4]))
+            # если статы уже рофл-минус (старый бан без снапшота) — настоящих значений нет, берём 0
+            snapshot = _sanitize_snapshot(dict(zip(BAN_SNAPSHOT_COLUMNS, row[:4])))
         else:
             snapshot = {c: 0 for c in BAN_SNAPSHOT_COLUMNS}
         snapshot_json = json.dumps(snapshot)
@@ -6477,12 +6510,14 @@ async def _apply_game_ban(user_id: int, username: str | None = None):
     await db_exec("UPDATE users SET game_banned = 1 WHERE user_id = ?", (user_id,))
     await _wipe_stats_for_ban(user_id)
 
-def _clean_stat(value) -> int:
-    """Значение из снапшота -> int >= 0 (отрицательного у нормального игрока быть не может)."""
+def _clean_stat(value, allow_negative: bool = False) -> int:
+    """Значение из снапшота -> int. Валюта: >= 0. Эволюция (allow_negative=True) может
+    быть отрицательной — её не трогаем."""
     try:
-        return max(0, int(value))
+        v = int(value)
     except Exception:
         return 0
+    return v if allow_negative else max(0, v)
 
 async def _restore_stats_after_unban(target_id: int):
     """Возвращает score/coins/evolution_level/rebirth_points к значениям на момент бана.
@@ -6499,12 +6534,14 @@ async def _restore_stats_after_unban(target_id: int):
     if not isinstance(snapshot, dict) or not snapshot:
         await db_exec("UPDATE users SET game_banned_snapshot = NULL WHERE user_id = ?", (target_id,))
         return
+    snapshot = _sanitize_snapshot(snapshot)
     await db_exec(
         "UPDATE users SET game_banned_snapshot = NULL, score = ?, coins = ?, "
         "evolution_level = ?, rebirth_points = ? WHERE user_id = ?",
         (
             _clean_stat(snapshot.get("score", 0)), _clean_stat(snapshot.get("coins", 0)),
-            _clean_stat(snapshot.get("evolution_level", 0)), _clean_stat(snapshot.get("rebirth_points", 0)),
+            _clean_stat(snapshot.get("evolution_level", 0), allow_negative=True),
+            _clean_stat(snapshot.get("rebirth_points", 0)),
             target_id,
         ),
     )
@@ -6512,13 +6549,9 @@ async def _restore_stats_after_unban(target_id: int):
 async def _unban_player_db(user_id: int):
     """Полный разбан одного игрока в БД и памяти. Порядок важен: сначала возвращаем статы
     из снапшота (пока game_banned = 1 и триггер 'не в минус' не вмешивается), и только потом
-    снимаем флаг. evolution_level дополнительно клампится: если снапшота не было и там
-    остался рофл-минус, эво не должно остаться отрицательным."""
+    снимаем флаг. Эволюция может быть отрицательной — её не клампим."""
     await _restore_stats_after_unban(user_id)
-    await db_exec(
-        "UPDATE users SET game_banned = 0, evolution_level = MAX(evolution_level, 0) WHERE user_id = ?",
-        (user_id,),
-    )
+    await db_exec("UPDATE users SET game_banned = 0 WHERE user_id = ?", (user_id,))
     _game_banned_ids.discard(user_id)
 
 # ВАЖНО: эти два хендлера стоят ПЕРЕД cmd_ban_player / cmd_unban_player — иначе их регэкспы
